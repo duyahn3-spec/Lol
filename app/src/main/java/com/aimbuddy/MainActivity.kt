@@ -20,142 +20,74 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.Log
-import android.view.Gravity
 import android.view.View
-import android.view.WindowManager
+import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val TAG = "ESP_MainActivity"
+        private const val TAG = "MainActivity"
         private const val REQUEST_MEDIA_PROJECTION = 1001
         private const val REQUEST_OVERLAY_PERMISSION = 1002
-
-        // Reduced resolution for T606 (4GB RAM)
         private const val CAPTURE_WIDTH = 320
         private const val CAPTURE_HEIGHT = 240
-        private const val CAPTURE_FPS = 15
-
-        private const val PREFS_NAME = "aimbuddy_prefs"
-        private const val ASSET_MODEL_PARAM = "models/yolo26n-opt.param"
-        private const val ASSET_MODEL_BIN = "models/yolo26n-opt.bin"
-
-        init {
-            System.loadLibrary("esp_native")
-        }
     }
 
-    // UI state
-    private var isRunning = false
-    private var statusText = "Status: Idle"
+    private lateinit var statusText: TextView
+    private lateinit var startButton: Button
+    private lateinit var stopButton: Button
 
-    // Overlay components
-    private var imguiOverlay: ImGuiGLSurface? = null
-    private var windowManager: WindowManager? = null
-    private var isOverlayVisible = false
-    private val isStopping = AtomicBoolean(false)
-    private val isStarting = AtomicBoolean(false)
-
-    // MediaProjection components
     private var mediaProjectionManager: MediaProjectionManager? = null
     private var mediaProjection: MediaProjection? = null
-    private var projectionCallbackRegistered = false
-    private val mediaProjectionCallback = object : Callback() {
-        override fun onStop() {
-            Log.w(TAG, "MediaProjection stopped by system/user")
-            runOnUiThread {
-                if (isRunning) {
-                    Toast.makeText(this@MainActivity, "Screen capture ended. ESP stopped.", Toast.LENGTH_LONG).show()
-                    stopESP()
-                }
-            }
-        }
-    }
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
-    private val imageThread = HandlerThread("esp-image-reader").also { it.start() }
+    private val imageThread = HandlerThread("image-reader").also { it.start() }
     private val imageHandler = Handler(imageThread.looper)
+    private var isRunning = false
+    private lateinit var detector: TFLiteDetector
 
-    // Display metrics
-    private var screenWidth = 1080
-    private var screenHeight = 2400
-    private var screenDensity = 1
-
-    // Rendering
-    private val renderHandler = Handler(Looper.getMainLooper())
-
-    // Native methods (only ESP overlay, no aim)
     private external fun nativeInit(assetManager: android.content.res.AssetManager,
                                     screenWidth: Int, screenHeight: Int): Boolean
     private external fun nativeStart()
     private external fun nativeStop()
     private external fun nativeShutdown()
-    private external fun nativeIsRunning(): Boolean
-    private external fun nativeSetModelPaths(paramPath: String?, binPath: String?)
-
-    private lateinit var modelCatalog: ModelCatalog
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        
-        // Simple UI (no Compose)
         setContentView(R.layout.activity_main)
-        
+
+        statusText = findViewById(R.id.statusText)
+        startButton = findViewById(R.id.startButton)
+        stopButton = findViewById(R.id.stopButton)
+
+        startButton.setOnClickListener { onStartClicked() }
+        stopButton.setOnClickListener { onStopClicked() }
+        stopButton.isEnabled = false
+
         enableImmersiveMode()
 
-        Log.i(TAG, "onCreate")
-
         val displayMetrics = DisplayMetrics()
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        windowManager?.defaultDisplay?.getRealMetrics(displayMetrics)
-        
-        if (displayMetrics.widthPixels < displayMetrics.heightPixels) {
-            screenWidth = displayMetrics.heightPixels
-            screenHeight = displayMetrics.widthPixels
-        } else {
-            screenWidth = displayMetrics.widthPixels
-            screenHeight = displayMetrics.heightPixels
-        }
-        screenDensity = displayMetrics.densityDpi
+        windowManager.defaultDisplay.getRealMetrics(displayMetrics)
+        val screenWidth = displayMetrics.widthPixels
+        val screenHeight = displayMetrics.heightPixels
 
-        Log.i(TAG, "Screen: ${screenWidth}x${screenHeight}, density: $screenDensity")
-
-        modelCatalog = ModelCatalog(this)
-
-        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
-                as MediaProjectionManager
+        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        detector = TFLiteDetector(this)
 
         if (!nativeInit(assets, screenWidth, screenHeight)) {
-            Log.e(TAG, "Failed to initialize native components")
-            Toast.makeText(this, "Failed to initialize ESP. Check model files.", Toast.LENGTH_LONG).show()
-            statusText = "Status: Init Failed"
+            statusText.text = "Init Failed"
+            Toast.makeText(this, "Native init failed", Toast.LENGTH_LONG).show()
         } else {
-            statusText = "Status: Ready"
+            statusText.text = "Ready"
         }
-
-        // Setup buttons
-        findViewById<android.widget.Button>(R.id.startButton).setOnClickListener {
-            onStartClicked()
-        }
-        findViewById<android.widget.Button>(R.id.stopButton).setOnClickListener {
-            onStopClicked()
-        }
-
-        // Update status text
-        findViewById<android.widget.TextView>(R.id.statusText).text = statusText
     }
 
     private fun onStartClicked() {
-        if (isRunning || isStarting.get()) return
-        
+        if (isRunning) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (!Settings.canDrawOverlays(this)) {
                 val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -164,10 +96,10 @@ class MainActivity : AppCompatActivity() {
                 return
             }
         }
-        requestMediaProjectionPermission()
+        requestMediaProjection()
     }
 
-    private fun requestMediaProjectionPermission() {
+    private fun requestMediaProjection() {
         val intent = mediaProjectionManager?.createScreenCaptureIntent()
         if (intent != null) {
             startActivityForResult(intent, REQUEST_MEDIA_PROJECTION)
@@ -198,52 +130,47 @@ class MainActivity : AppCompatActivity() {
         when (requestCode) {
             REQUEST_OVERLAY_PERMISSION -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Settings.canDrawOverlays(this)) {
-                    requestMediaProjectionPermission()
+                    requestMediaProjection()
                 } else {
-                    Toast.makeText(this, "Overlay permission required.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Overlay permission required", Toast.LENGTH_SHORT).show()
                 }
             }
             REQUEST_MEDIA_PROJECTION -> {
                 if (resultCode == Activity.RESULT_OK && data != null) {
                     startESP(data)
                 } else {
-                    Toast.makeText(this, "MediaProjection permission required.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "MediaProjection permission required", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
 
     private fun startESP(data: Intent) {
-        if (isStarting.get() || isRunning) return
-        
-        isStarting.set(true)
-        statusText = "Status: Starting..."
-        findViewById<android.widget.TextView>(R.id.statusText).text = statusText
-
         mediaProjection = mediaProjectionManager?.getMediaProjection(Activity.RESULT_OK, data)
         if (mediaProjection == null) {
-            Toast.makeText(this, "Failed to start screen capture", Toast.LENGTH_SHORT).show()
-            isStarting.set(false)
-            statusText = "Status: Failed"
-            findViewById<android.widget.TextView>(R.id.statusText).text = statusText
+            Toast.makeText(this, "Failed to get media projection", Toast.LENGTH_SHORT).show()
             return
         }
 
-        // Setup ImageReader
         imageReader = ImageReader.newInstance(CAPTURE_WIDTH, CAPTURE_HEIGHT, PixelFormat.RGBA_8888, 2)
         imageReader?.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage()
-            if (image != null) {
-                // Image is passed to native code via JNI for ESP rendering
-                // No touch injection, only ESP overlay
-                image.close()
+            image?.let {
+                val detection = detector.detect(it)
+                detection?.let { det ->
+                    val centerX = det.centerX * CAPTURE_WIDTH
+                    val centerY = det.centerY * CAPTURE_HEIGHT
+                    val dx = centerX - CAPTURE_WIDTH / 2
+                    val dy = centerY - CAPTURE_HEIGHT / 2
+                    sendToESP32(dx.toInt(), dy.toInt())
+                }
+                it.close()
             }
         }, imageHandler)
 
-        // Create VirtualDisplay
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "ESP_Display",
-            CAPTURE_WIDTH, CAPTURE_HEIGHT, screenDensity,
+            CAPTURE_WIDTH, CAPTURE_HEIGHT, 160,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface,
             null, null
@@ -251,52 +178,50 @@ class MainActivity : AppCompatActivity() {
 
         if (virtualDisplay == null) {
             Toast.makeText(this, "Failed to create virtual display", Toast.LENGTH_SHORT).show()
-            stopESP()
             return
         }
 
-        // Start native ESP overlay (no aim)
         if (nativeStart()) {
             isRunning = true
-            statusText = "Status: Running (ESP Only)"
-            findViewById<android.widget.TextView>(R.id.statusText).text = statusText
-            Toast.makeText(this, "ESP started (Visual Assist only)", Toast.LENGTH_SHORT).show()
+            startButton.isEnabled = false
+            stopButton.isEnabled = true
+            statusText.text = "Running (YOLO + ESP)"
+            Toast.makeText(this, "ESP started", Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(this, "Failed to start ESP engine", Toast.LENGTH_SHORT).show()
-            stopESP()
+            Toast.makeText(this, "Failed to start native ESP", Toast.LENGTH_SHORT).show()
         }
-        
-        isStarting.set(false)
     }
 
     private fun stopESP() {
-        if (!isRunning && !isStarting.get()) return
-        
+        if (!isRunning) return
         isRunning = false
-        isStarting.set(false)
-        statusText = "Status: Stopping..."
-        findViewById<android.widget.TextView>(R.id.statusText).text = statusText
-
         nativeStop()
-        
+
         virtualDisplay?.release()
         virtualDisplay = null
-        
         imageReader?.close()
         imageReader = null
-        
         mediaProjection?.stop()
         mediaProjection = null
-        
-        statusText = "Status: Stopped"
-        findViewById<android.widget.TextView>(R.id.statusText).text = statusText
-        Log.i(TAG, "ESP stopped")
+
+        startButton.isEnabled = true
+        stopButton.isEnabled = false
+        statusText.text = "Stopped"
+        Toast.makeText(this, "ESP stopped", Toast.LENGTH_SHORT).show()
     }
 
     override fun onDestroy() {
-        Log.i(TAG, "onDestroy")
         stopESP()
         nativeShutdown()
         super.onDestroy()
+    }
+
+    private fun sendToESP32(dx: Int, dy: Int) {
+        // TODO: Gửi dx, dy qua BLE đến ESP32
+        Log.d(TAG, "dx=$dx, dy=$dy")
+    }
+
+    init {
+        System.loadLibrary("esp_native")
     }
 }
