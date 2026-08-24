@@ -4,35 +4,34 @@ plugins {
 }
 
 android {
-    namespace = "com.aimbuddy"
-    compileSdk = 34
+    namespace 'com.aimbuddy'
+    compileSdk 34
 
     defaultConfig {
-        applicationId = "com.aimbuddy"
-        minSdk = 24
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        applicationId 'com.aimbuddy'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
     }
 
     buildTypes {
         release {
-            minifyEnabled = false
+            minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            debuggable true
         }
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
 
     kotlinOptions {
         jvmTarget = '11'
-    }
-
-    buildFeatures {
-        buildConfig = true
     }
 }
 
